@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+  <title>Asriel Dreamer Fight — Demo (Keyboard + Joystick)</title>
+  <!-- Phaser 3 CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/phaser@3.60.0/dist/phaser.min.js"></script>
+  <!-- nipplejs for mobile joystick -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/nipplejs/0.9.0/nipplejs.min.js"></script>
+  <style>
+    html,body { height:100%; margin:0; background:#0a0a0a; color:#eee; font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial; }
+    #game-container { width:100%; height:100vh; display:block; }
+    .ui { position: absolute; left:12px; top:12px; z-index: 1000; }
+    #joystick-zone { position:absolute; right:12px; bottom:12px; width:140px; height:140px; z-index:1000; }
+    #hint { position:absolute; left:12px; bottom:12px; z-index:1000; background:rgba(0,0,0,0.5); padding:8px; border-radius:8px; }
+    button { background:#222; color:#fff; border:1px solid #444; padding:6px 10px; border-radius:6px }
+  </style>
+</head>
+<body>
+  <div id="game-container"></div>
+  <div id="joystick-zone"></div>
+  <div id="hint">Controls: WASD / Arrows to move • Tap + Joystick on mobile • Space to shoot (player soul pulse)</div>
+
+<script>
+// Phaser config
+const config = {
+  type: Phaser.AUTO,
+  parent: 'game-container',
+  backgroundColor: '#0b0b1a',
+  scale: {
+    mode: Phaser.Scale.FIT,
+    autoCenter: Phaser.Scale.CENTER_BOTH,
+    width: 900,
+    height: 600
+  },
+  physics: {
+    default: 'arcade',
+    arcade: { debug: false }
+  },
+  scene: {
+    preload: preload,
+    create: create,
+    update: update
+  }
+};
+
+const game = new Phaser.Game(config);
+let joystickManager = null;
+
+function preload() {
+  // simple shapes drawn at runtime, but we can load a pixel font if desired
+}
+
+let player, cursors, shootKey, bullets, boss, bossBullets, bossPhase = 0;
+let playerMaxHP = 40, playerHP = 40;
+let bossMaxHP = 200, bossHP = 200;
+let lastShot = 0;
+let timeSincePhase = 0;
+let isMobile = false;
+let moveVector = { x:0, y:0 };
+
+function create() {
+  isMobile = this.sys.game.device.os.android || this.sys.game.device.os.iOS || this.sys.game.device.os.iPad;
+
+  // Add a background gradient using graphics
+  const g = this.add.graphics();
+  const grd = g.createLinearGradient(0, 0, 0, this.scale.height);
+  // Phaser graphics gradients aren't direct; we'll emulate with a big rectangle and alpha bars
+  for (let i = 0; i < 200; i++) {
+    const t = i/200;
+    g.fillStyle(Phaser.Display.Color.GetColor(12 + t*20, 8 + t*20, 30 + t*60), 1);
+    g.fillRect(0, (this.scale.height/200)*i, this.scale.width, (this.scale.height/200)+1);
+  }
+
+  // Player (soul) as a circle
+  player = this.add.circle(this.scale.width/2, this.scale.height - 100, 12, 0xffffff);
+  this.physics.add.existing(player);
+  player.body.setCircle(12);
+  player.body.setCollideWorldBounds(true);
+  player.speed = 220;
+
+  // Bullets group (player pulse)
+  bullets = this.physics.add.group({ classType: Phaser.GameObjects.Ellipse, runChildUpdate: false });
+
+  // Boss entity (Asriel Dreamer-stylized)
+  boss = this.add.container(this.scale.width/2, 140);
+  const body = this.add.ellipse(0, 0, 220, 140, 0x6b1f6b);
+  const face = this.add.circle(0, -10, 28, 0xffcc33);
+  const hornL = this.add.triangle(-70,-50,-60,-85,-50,-50,0xdddddd);
+  const hornR = this.add.triangle(70,-50,60,-85,50,-50,0xdddddd);
+  const eyes = this.add.graphics();
+  eyes.fillStyle(0x222222,1); eyes.fillRect(-28, -22, 18, 8); eyes.fillRect(10,-22,18,8);
+  boss.add([body, hornL, hornR, face, eyes]);
+  boss.health = bossMaxHP;
+
+  // Boss bullets
+  bossBullets = this.physics.add.group();
+
+  // Collisions
+  this.physics.add.overlap(bossBullets, player, (p, b) => {
+    // boss bullet hits player
+    if (this._lastHit && this.time.now - this._lastHit < 300) return; // small invuln
+    this._lastHit = this.time.now;
+    playerHP = Math.max(0, playerHP - 1);
+    shakeCamera(this);
+  });
+
+  this.physics.add.overlap(bullets, boss, (bPulse, bossObj) => {
+    // player bullets hit boss
+    if (bPulse && bPulse.active) {
+      bossHit(this, 6);
+      bPulse.destroy();
+    }
+  });
+
+  // Health bars
+  this.playerHpBar = this.add.rectangle(120, this.scale.height-20, 200, 12).setOrigin(0.5).setStrokeStyle(2, 0x333333);
+  this.playerHpFill = this.add.rectangle(120, this.scale.height-20, 196, 8).setOrigin(0.5,0.5).setFillStyle(0xff6699);
+  this.bossHpBar = this.add.rectangle(this.scale.width/2, 40, 520, 18).setOrigin(0.5).setStrokeStyle(2, 0x333333);
+  this.bossHpFill = this.add.rectangle(this.scale.width/2 - 260 + 6, 40, 508, 14).setOrigin(0,0.5).setFillStyle(0x66ccff);
+
+  // Input
+  cursors = this.input.keyboard.createCursorKeys();
+  shootKey = this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.SPACE);
+  this.input.keyboard.addKeys('W,A,S,D');
+
+  // Mobile joystick via nipplejs
+  if (isMobile) {
+    const zone = document.getElementById('joystick-zone');
+    joystickManager = nipplejs.create({ zone: zone, mode: 'static', position: { left: '50%', top: '50%' }, size: 120, color: '#888' });
+    joystickManager.on('move', (evt, data) => {
+      if (!data) return;
+      const angle = data.angle.radian; const strength = data.force;
+      moveVector.x = Math.cos(angle) * strength;
+      moveVector.y = Math.sin(angle) * strength;
+    });
+    joystickManager.on('end', () => { moveVector.x = 0; moveVector.y = 0; });
+
+    // Tap to shoot on mobile screen
+    this.input.on('pointerdown', (pointer) => {
+      // ignore taps on joystick area
+      const zoneRect = zone.getBoundingClientRect();
+      if (pointer.clientX >= zoneRect.left && pointer.clientX <= zoneRect.right && pointer.clientY >= zoneRect.top && pointer.clientY <= zoneRect.bottom) return;
+      playerShoot(this);
+    });
+  }
+
+  // Show simple instructions overlay on desktop to click to shoot
+  if (!isMobile) {
+    this.input.on('pointerdown', () => playerShoot(this));
+  }
+
+  // Start first phase
+  bossPhase = 0;
+  timeSincePhase = 0;
+}
+
+function update(time, delta) {
+  // Update movement (keyboard + joystick)
+  let vx = 0, vy = 0;
+  if (!isMobile) {
+    if (cursors.left.isDown || this.input.keyboard.keys[65] && this.input.keyboard.keys[65].isDown) vx = -1; // A
+    if (cursors.right.isDown || this.input.keyboard.keys[68] && this.input.keyboard.keys[68].isDown) vx = 1; // D
+    if (cursors.up.isDown || this.input.keyboard.keys[87] && this.input.keyboard.keys[87].isDown) vy = -1; // W
+    if (cursors.down.isDown || this.input.keyboard.keys[83] && this.input.keyboard.keys[83].isDown) vy = 1; // S
+  } else {
+    vx = moveVector.x; vy = moveVector.y;
+  }
+  // normalize
+  const mag = Math.hypot(vx, vy) || 1;
+  player.body.setVelocity((vx/mag) * player.speed, (vy/mag) * player.speed);
+
+  // Shooting (space)
+  if (!isMobile && shootKey.isDown) {
+    if (time - lastShot > 180) { playerShoot(this); lastShot = time; }
+  }
+
+  // Boss logic
+  timeSincePhase += delta;
+  if (boss.health <= 0) {
+    // boss defeated
+    bossDefeated(this);
+    return;
+  }
+
+  runBossAI(this, time, delta);
+
+  // Update HP bars
+  this.playerHpFill.width = Phaser.Math.Clamp((playerHP/playerMaxHP) * 196, 0.1, 196);
+  this.bossHpFill.width = Phaser.Math.Clamp((boss.health/bossMaxHP) * 508, 0.1, 508);
+
+  // End game if player dead
+  if (playerHP <= 0) {
+    this.scene.pause();
+    showMessage(this, 'You lost...', 3000);
+  }
+}
+
+// Player shoot
+function playerShoot(scene) {
+  const pulse = scene.add.circle(player.x, player.y - 22, 8, 0xffdddd);
+  scene.physics.add.existing(pulse);
+  pulse.body.setVelocity(0, -420);
+  pulse.body.setCircle(8);
+  pulse.body.allowGravity = false;
+  pulse.setDepth(10);
+  bullets.add(pulse);
+  // destroy after a time
+  scene.time.delayedCall(1400, () => { if (pulse && pulse.destroy) pulse.destroy(); });
+}
+
+// Boss takes damage with small invulnerability and phase shift
+function bossHit(scene, dmg) {
+  boss.health = Math.max(0, boss.health - dmg);
+  // flash
+  scene.tweens.add({ targets: boss.list[3], scale: 1.25, duration: 80, yoyo: true });
+  // small phase toggle when HP crosses thresholds
+  if (boss.health < bossMaxHP*0.66 && bossPhase < 1) { bossPhase = 1; timeSincePhase = 0; }
+  if (boss.health < bossMaxHP*0.33 && bossPhase < 2) { bossPhase = 2; timeSincePhase = 0; }
+}
+
+// Camera shake helper
+function shakeCamera(scene) { scene.cameras.main.shake(150, 0.008); }
+
+function bossDefeated(scene) {
+  scene.scene.pause();
+  showMessage(scene, 'Asriel Dreamer falls... You win!', 5000);
+}
+
+function runBossAI(scene, time, delta) {
+  // simple patterns based on bossPhase
+  if (bossPhase === 0) {
+    // slow spread bullets every 900ms
+    if (!boss._lastFire || time - boss._lastFire > 900) {
+      boss._lastFire = time;
+      spawnSpread(scene, boss.x, boss.y+30, 7, Math.PI/2, 150, 0.28);
+    }
+    // gentle bob
+    boss.y = 120 + Math.sin(time/700)*20;
+  } else if (bossPhase === 1) {
+    // faster homing beams + rotating rings
+    if (!boss._lastFire || time - boss._lastFire > 650) {
+      boss._lastFire = time;
+      spawnHoming(scene, boss.x, boss.y+20, 3, 160);
+    }
+    if (!boss._lastRing || time - boss._lastRing > 2400) {
+      boss._lastRing = time;
+      spawnRing(scene, boss.x, boss.y, 10, 160, 600);
+    }
+    boss.y = 120 + Math.sin(time/500)*26;
+  } else if (bossPhase === 2) {
+    // intense: rotating spirals
+    if (!boss._lastFire || time - boss._lastFire > 260) {
+      boss._lastFire = time;
+      spawnSpiral(scene, boss.x, boss.y, 14, 220, time/40);
+    }
+    boss.y = 100 + Math.sin(time/300)*40;
+  }
+}
+
+// Spawn helpers
+function spawnSpread(scene, x, y, count, centerAngle, speed, angleSpread) {
+  for (let i = 0; i < count; i++) {
+    const a = centerAngle + (i - (count-1)/2) * angleSpread;
+    spawnBossBullet(scene, x, y, Math.cos(a)*speed, Math.sin(a)*speed, 8);
+  }
+}
+
+function spawnHoming(scene, x, y, count, speed) {
+  for (let i=0;i<count;i++) {
+    const b = spawnBossBullet(scene, x + (i-1)*12, y, 0, 0, 10);
+    // add a homing tween to follow player over time
+    scene.tweens.add({
+      targets: b.body.velocity,
+      x: (player.x - b.x) / 0.9,
+      y: (player.y - b.y) / 0.9,
+      duration: 900,
+      ease: 'Sine.easeInOut'
+    });
+  }
+}
+
+function spawnRing(scene, x, y, count, speed, life) {
+  for (let i=0;i<count;i++) {
+    const a = (i/count) * Math.PI*2;
+    spawnBossBullet(scene, x + Math.cos(a)*12, y + Math.sin(a)*12, Math.cos(a)*speed, Math.sin(a)*speed, 8, life);
+  }
+}
+
+function spawnSpiral(scene, x, y, count, radius, offset) {
+  for (let i=0;i<count;i++) {
+    const angle = offset/100 + i*(Math.PI*2/count);
+    const bx = x + Math.cos(angle) * 12;
+    const by = y + Math.sin(angle) * 12;
+    const vx = Math.cos(angle) * (radius/80);
+    const vy = Math.sin(angle) * (radius/80);
+    spawnBossBullet(scene, bx, by, vx*120, vy*120, 7, 2000 + (i*60));
+  }
+}
+
+function spawnBossBullet(scene, x, y, vx, vy, r=8, life=3000) {
+  const b = scene.add.circle(x, y, r, 0x88aaff);
+  scene.physics.add.existing(b);
+  b.body.setCircle(r);
+  b.body.allowGravity = false;
+  b.body.setVelocity(vx, vy);
+  bossBullets.add(b);
+  scene.time.delayedCall(life, () => { if (b && b.destroy) b.destroy(); });
+  return b;
+}
+
+function showMessage(scene, text, duration=2000) {
+  const msg = scene.add.text(scene.scale.width/2, scene.scale.height/2, text, { fontSize: '28px', fontFamily:'Arial', color:'#ffffff' }).setOrigin(0.5).setDepth(100);
+  scene.tweens.add({ targets: msg, alpha: { from: 0, to: 1 }, duration: 160, yoyo:false });
+  scene.time.delayedCall(duration, () => { msg.destroy(); scene.scene.resume(); });
+}
+
+</script>
+</body>
+</html>
